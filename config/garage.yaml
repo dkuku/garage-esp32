@@ -1,0 +1,172 @@
+# Commands -> header 0x23
+# Status   -> header 0x40
+# The unit echos all commands under header 0x40
+
+esphome:
+  name: garage-door
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret encryption
+  # Realtime status updates
+  batch_delay: 0ms
+
+ota:
+  - platform: esphome
+
+wifi:
+  networks:
+  - ssid: !secret wifi-1-ssid
+    password: !secret wifi-1-pw
+  - ssid: !secret wifi-2-ssid
+    password: !secret wifi-2-pw
+
+captive_portal:
+
+uart:
+  id: uart_bus
+  tx_pin: GPIO25
+  rx_pin: GPIO32
+  baud_rate: 115200
+  data_bits: 8
+  stop_bits: 1
+  parity: NONE
+  debug:
+
+external_components:
+  - source: github://eigger/espcomponents@latest
+    components: [ uartex ]
+    refresh: always
+
+uartex:
+  id: bus_uartex
+  rx_timeout: 10ms
+  tx_delay: 100ms
+  tx_timeout: 500ms
+  tx_retry_cnt: 3
+  rx_header: [0x40, 0x11]
+  # this will look for both messages of length 17
+  rx_length: 17
+  # and ending with 0x0d
+  rx_footer: [0x0d]
+  tx_header: []
+  tx_footer: [0x0d]
+  tx_checksum: !lambda |-
+    uint32_t crc = 0;
+    for (int i = 0; i < len; i++) {
+      crc += data[i];
+    }
+    return (crc & 0xFF);
+  version:
+    disabled: False
+  error:
+    disabled: False
+  log:
+    disabled: False
+
+# Door moving direction
+# [40] [11] 49 00 f0 02 79 02 7e 75 68 00 26 04 00 8c [0d] -> Opening
+# [40] [11] 49 02 f0 02 79 02 7e 75 7c 00 1f 00 00 97 [0d] -> Closing
+# [40] [11] 49 01 f0 02 79 02 7e 75 a8 00 24 00 02 c9 [0d] -> Stoped
+#              ^^-here
+text_sensor:
+  - platform: uartex
+    name: "Operation"
+    lambda: |-
+      if (len == 14) {
+        if (data[1] == 0x00) return "Opening";
+        if (data[1] == 0x01) return "Stopped";
+        if (data[1] == 0x02) return "Closing";
+      }
+      return std::string("Unknown len") + std::to_string(len);
+
+# Door open position in %
+# [40] [11] 49 01 f0 02 79 02 7e 75 a8 00 24 00 02 c9 [0d] -> 0%
+# [40] [11] 49 00 f0 02 79 02 7e 75 68 00 26 04 00 8c [0d] -> 04%
+# [40] [11] 49 01 f0 02 79 02 7e 6f fe 00 4c 64 02 a5 [0d] -> 100%
+#                                            ^^-here
+sensor:
+  - platform: uartex
+    name: "Door status"
+    unit_of_measurement: "%"
+    state:
+      data: [0x00] # read all
+      mask: [0x00]
+    state_number:
+      offset: 11
+      length: 1
+      precision: 0
+
+button:
+  - platform: restart
+    name: "Device restart"
+
+  - platform: template
+    name: "Open"
+    id: button_garage_open
+    icon: "mdi:icon-double-angle-up"
+    on_press:
+      - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x00, 0x00] }
+      - logger.log: "Send command OPEN"
+
+  - platform: template
+    name: "Stop"
+    id: button_garage_stop
+    icon: "mdi:icon-pause"
+    on_press:
+      - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x01, 0x00] }
+      - logger.log: "Send command STOP"
+
+  - platform: template
+    name: "Close"
+    id: button_garage_close
+    icon: "mdi:icon-double-angle-down"
+    on_press:
+      - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x02, 0x00] }
+      - logger.log: "Send command CLOSE"
+
+  - platform: template
+    name: "Partial open"
+    id: button_garage_partial
+    icon: "mdi:icon-angle-up"
+    on_press:
+      - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x03, 0x00] }
+      - logger.log: "Send command PARTIAL OPEN"
+
+# CMD LED ON
+# [23] [07] 41 f0 01 79 0d
+# CMD LED OFF
+# [23] [07] 41 f1 00 79 0d
+#              ^^-here
+# STATUS LED OFF
+# [40] [11] 49 01 f1 02 9f 02 a4 75 a6 00 26 00 02 16 [0d] 
+# STATUS LED ON
+# [40] [11] 49 01 f0 02 79 02 7e 75 a8 00 24 00 02 c9 [0d] -> 0%
+# [40] [11] 49 00 f0 02 79 02 7e 75 68 00 26 04 00 8c [0d] -> 04%
+# [40] [11] 49 01 f0 02 79 02 7e 6f fe 00 4c 64 02 a5 [0d] -> 100%
+#                 ^^-here
+light:
+- platform: uartex
+  name: "LED"
+  state:
+    data: [0x00] # read all
+    mask: [0x00]
+  state_on:
+    offset: 2
+    data: [0xf0]
+  state_off:
+    offset: 2
+    data: [0xf1]
+  command_on:
+    data: [0x23, 0x07, 0x41, 0xf0, 0x00]
+  command_off:
+    data: [0x23, 0x07, 0x41, 0xf1, 0x00]
