@@ -1,41 +1,48 @@
-# Commands -> header 0x23
-# Status   -> header 0x40
-# The unit echos all commands under header 0x40
-
 esphome:
-  name: garage-door
+  name: garage_shutter
+  friendly_name: Brama Garażowa
 
 esp32:
-  board: esp32dev
+  board: esp32-c3-devkitm-1
+  variant: esp32c3
   framework:
-    type: arduino
+    type: esp-idf
 
-# Enable logging
 logger:
-
-# Enable Home Assistant API
-api:
-  encryption:
-    key: !secret encryption
-  # Realtime status updates
-  batch_delay: 0ms
+  level: NONE
 
 ota:
   - platform: esphome
 
 wifi:
   networks:
-  - ssid: !secret wifi-1-ssid
-    password: !secret wifi-1-pw
-  - ssid: !secret wifi-2-ssid
-    password: !secret wifi-2-pw
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_password
+  - ssid: !secret hotspot_wifi_ssid
+    password: !secret hotspot_wifi_password
+  power_save_mode: NONE
+  output_power: 8.5dB
+  fast_connect: false
+  manual_ip:
+    static_ip: 192.168.1.156
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+
+  ap:
+    ssid: "GD-Fallback"
+    password: !secret secret_garage_door
 
 captive_portal:
 
+debug:
+
+# --- UART to gate motor controller ---
+# Protocol "protov1": TX=[0x23][LEN][0x41][CMD][PARAM][CRC][0x0D]
+#                     RX=[0x40][LEN][TYPE][DATA...][CRC][0x0D]
 uart:
   id: uart_bus
-  tx_pin: GPIO25
-  rx_pin: GPIO32
+  tx_pin: GPIO21
+  rx_pin: GPIO20
   baud_rate: 115200
   data_bits: 8
   stop_bits: 1
@@ -54,9 +61,7 @@ uartex:
   tx_timeout: 500ms
   tx_retry_cnt: 3
   rx_header: [0x40, 0x11]
-  # this will look for both messages of length 17
   rx_length: 17
-  # and ending with 0x0d
   rx_footer: [0x0d]
   tx_header: []
   tx_footer: [0x0d]
@@ -73,92 +78,142 @@ uartex:
   log:
     disabled: False
 
-# Door moving direction
-# [40] [11] 49 00 f0 02 79 02 7e 75 68 00 26 04 00 8c [0d] -> Opening
-# [40] [11] 49 02 f0 02 79 02 7e 75 7c 00 1f 00 00 97 [0d] -> Closing
-# [40] [11] 49 01 f0 02 79 02 7e 75 a8 00 24 00 02 c9 [0d] -> Stoped
-#              ^^-here
-text_sensor:
-  - platform: uartex
-    name: "Operation"
-    lambda: |-
-      if (len == 14) {
-        if (data[1] == 0x00) return "Opening";
-        if (data[1] == 0x01) return "Stopped";
-        if (data[1] == 0x02) return "Closing";
-      }
-      return std::string("Unknown len") + std::to_string(len);
+# --- Globals for auto-close and position target ---
+globals:
+  - id: auto_close_minutes
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: auto_close_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: position_target
+    type: int
+    restore_value: false
+    initial_value: '-1'
 
-# Door open position in %
-# [40] [11] 49 01 f0 02 79 02 7e 75 a8 00 24 00 02 c9 [0d] -> 0%
-# [40] [11] 49 00 f0 02 79 02 7e 75 68 00 26 04 00 8c [0d] -> 04%
-# [40] [11] 49 01 f0 02 79 02 7e 6f fe 00 4c 64 02 a5 [0d] -> 100%
-#                                            ^^-here
+# =====================================================================
+# SENSORS
+# =====================================================================
+# RX frame after header strip (14 bytes):
+#   [0]=0x49 [1]=DIR [2]=LED [3-4]=P1 [5-6]=P2 [7-9]=? [10]=? [11]=POS [12]=MOVE [13]=CRC
 sensor:
   - platform: uartex
     name: "Door status"
+    id: door_status
     unit_of_measurement: "%"
+    icon: "mdi:garage-variant"
     state:
-      data: [0x00] # read all
+      data: [0x00]
       mask: [0x00]
     state_number:
       offset: 11
       length: 1
       precision: 0
 
+  # Motor cycle counter (uint16 big-endian from bytes 3-4)
+  - platform: uartex
+    name: "Motor Cycles"
+    id: motor_cycles
+    icon: "mdi:counter"
+    entity_category: diagnostic
+    state:
+      data: [0x00]
+      mask: [0x00]
+    lambda: |-
+      if (len >= 5) return {(float)((data[3] << 8) | data[4])};
+      return {};
+
+  # Motor load / current indicator (byte 10)
+  - platform: uartex
+    name: "Motor Load"
+    id: motor_load
+    icon: "mdi:flash"
+    entity_category: diagnostic
+    state:
+      data: [0x00]
+      mask: [0x00]
+    state_number:
+      offset: 10
+      length: 1
+      precision: 0
+
+  - platform: uptime
+    id: uptime_sensor
+    name: "Uptime"
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  - platform: dht
+    pin: GPIO4
+    model: DHT11
+    temperature:
+      name: "Temperatura w Garażu"
+    humidity:
+      name: "Wilgotność w Garażu"
+    update_interval: 60s
+
+  - platform: debug
+    free:
+      name: "Free Heap"
+      unit_of_measurement: "kB"
+      filters:
+        - lambda: return x / 1024.0;
+      accuracy_decimals: 1
+
+# =====================================================================
+# BUTTONS - direct door commands
+# =====================================================================
 button:
   - platform: restart
     name: "Device restart"
+    id: restart_button
 
   - platform: template
     name: "Open"
     id: button_garage_open
-    icon: "mdi:icon-double-angle-up"
+    icon: "mdi:arrow-up-bold"
     on_press:
       - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x00, 0x00] }
-      - logger.log: "Send command OPEN"
+      - logger.log: "TX: OPEN"
 
   - platform: template
     name: "Stop"
     id: button_garage_stop
-    icon: "mdi:icon-pause"
+    icon: "mdi:pause"
     on_press:
+      - lambda: 'id(position_target) = -1;'
       - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x01, 0x00] }
-      - logger.log: "Send command STOP"
+      - logger.log: "TX: STOP"
 
   - platform: template
     name: "Close"
     id: button_garage_close
-    icon: "mdi:icon-double-angle-down"
+    icon: "mdi:arrow-down-bold"
     on_press:
       - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x02, 0x00] }
-      - logger.log: "Send command CLOSE"
+      - logger.log: "TX: CLOSE"
 
   - platform: template
     name: "Partial open"
     id: button_garage_partial
-    icon: "mdi:icon-angle-up"
+    icon: "mdi:arrow-collapse-up"
     on_press:
       - uartex.write: { id: bus_uartex, data: [0x23, 0x07, 0x41, 0x03, 0x00] }
-      - logger.log: "Send command PARTIAL OPEN"
+      - logger.log: "TX: PARTIAL"
 
-# CMD LED ON
-# [23] [07] 41 f0 01 79 0d
-# CMD LED OFF
-# [23] [07] 41 f1 00 79 0d
-#              ^^-here
-# STATUS LED OFF
-# [40] [11] 49 01 f1 02 9f 02 a4 75 a6 00 26 00 02 16 [0d] 
-# STATUS LED ON
-# [40] [11] 49 01 f0 02 79 02 7e 75 a8 00 24 00 02 c9 [0d] -> 0%
-# [40] [11] 49 00 f0 02 79 02 7e 75 68 00 26 04 00 8c [0d] -> 04%
-# [40] [11] 49 01 f0 02 79 02 7e 6f fe 00 4c 64 02 a5 [0d] -> 100%
-#                 ^^-here
+# =====================================================================
+# LED - gate controller built-in LED
+# =====================================================================
 light:
 - platform: uartex
   name: "LED"
+  icon: "mdi:led-on"
   state:
-    data: [0x00] # read all
+    data: [0x00]
     mask: [0x00]
   state_on:
     offset: 2
@@ -170,3 +225,218 @@ light:
     data: [0x23, 0x07, 0x41, 0xf0, 0x00]
   command_off:
     data: [0x23, 0x07, 0x41, 0xf1, 0x00]
+
+# =====================================================================
+# AUTO-CLOSE TIMER (replaces original req_auto_close)
+# =====================================================================
+number:
+  - platform: template
+    name: "Auto-close timer"
+    id: auto_close_timer
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "min"
+    min_value: 0
+    max_value: 60
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    set_action:
+      - lambda: 'id(auto_close_minutes) = (int)x;'
+      - logger.log:
+          format: "Auto-close set to %d min"
+          args: ['(int)x']
+
+# =====================================================================
+# TEXT SENSORS
+# =====================================================================
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "Adres IP"
+    ssid:
+      name: "SSID"
+    mac_address:
+      name: "MAC"
+
+  - platform: uartex
+    name: "UART last reply"
+    id: uart_last_response
+    icon: "mdi:console"
+    lambda: |-
+      std::string hex_str = "";
+      for (int i = 0; i < len; i++) {
+        char buf[5];
+        sprintf(buf, "%02X ", data[i]);
+        hex_str += buf;
+      }
+      return { hex_str };
+
+  - platform: uartex
+    name: "Operation"
+    id: door_operation
+    icon: "mdi:state-machine"
+    lambda: |-
+      if (len >= 2) {
+        if (data[1] == 0x00) return {"Opening"};
+        if (data[1] == 0x01) return {"Stopped"};
+        if (data[1] == 0x02) return {"Closing"};
+      }
+      return {"Unknown"};
+
+  - platform: template
+    name: "Uptime Czytelny"
+    icon: "mdi:clock-outline"
+    update_interval: 60s
+    lambda: |-
+      uint32_t s = (uint32_t)id(uptime_sensor).state;
+      if (s > 3000000000) return {"Starting..."};
+      int d = s / 86400;
+      int h = (s % 86400) / 3600;
+      int m = (s % 3600) / 60;
+      char buf[20];
+      sprintf(buf, "%dd %dh %dm", d, h, m);
+      return {buf};
+
+  - platform: debug
+    reset_reason:
+      name: "Restart reason"
+
+# =====================================================================
+# BINARY SENSORS
+# =====================================================================
+binary_sensor:
+  - platform: status
+    name: "Connection Status"
+
+  - platform: uartex
+    name: "Door Moving"
+    id: door_moving
+    icon: "mdi:motion"
+    device_class: moving
+    state:
+      data: [0x00]
+      mask: [0x00]
+    state_on:
+      offset: 12
+      data: [0x00]
+    state_off:
+      offset: 12
+      data: [0x02]
+
+# =====================================================================
+# COVER - main garage door entity with position control
+# =====================================================================
+cover:
+  - platform: template
+    name: "Garage"
+    id: garage_cover
+    device_class: garage
+    optimistic: false
+    has_position: true
+
+    lambda: |-
+      if (id(door_status).has_state()) {
+        float pos = id(door_status).state / 100.0;
+        if (id(door_operation).has_state()) {
+          auto op = id(door_operation).state;
+          if (op == "Opening") {
+            id(garage_cover).current_operation = esphome::cover::COVER_OPERATION_OPENING;
+          } else if (op == "Closing") {
+            id(garage_cover).current_operation = esphome::cover::COVER_OPERATION_CLOSING;
+          } else {
+            id(garage_cover).current_operation = esphome::cover::COVER_OPERATION_IDLE;
+          }
+        }
+        return pos;
+      }
+      return {};
+
+    open_action:
+      - button.press: button_garage_open
+    close_action:
+      - button.press: button_garage_close
+    stop_action:
+      - button.press: button_garage_stop
+
+    # Position control: open/close toward target, stop when reached
+    position_action:
+      - lambda: |-
+          int target = (int)(pos * 100);
+          id(position_target) = target;
+          float current = id(door_status).state;
+          if (target > current) {
+            // Need to open
+            id(button_garage_open).press();
+          } else if (target < current) {
+            // Need to close
+            id(button_garage_close).press();
+          }
+
+# =====================================================================
+# INTERVALS & AUTOMATIONS
+# =====================================================================
+interval:
+  # Watchdog: restart if WiFi lost for 30 min
+  - interval: 30min
+    then:
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - button.press: restart_button
+
+  # Position target: check every 500ms if target reached
+  - interval: 500ms
+    then:
+      - lambda: |-
+          int target = id(position_target);
+          if (target < 0) return;  // no target set
+          if (!id(door_status).has_state()) return;
+
+          float current = id(door_status).state;
+          float diff = current - (float)target;
+
+          // Stop when within 2% of target
+          if (diff > -2.0 && diff < 2.0) {
+            id(position_target) = -1;
+            id(button_garage_stop).press();
+            ESP_LOGI("cover", "Position target %d%% reached (current %.0f%%)", target, current);
+          }
+
+  # Auto-close: check every second
+  - interval: 1s
+    then:
+      - lambda: |-
+          static uint32_t open_since = 0;
+          int minutes = id(auto_close_minutes);
+          if (minutes <= 0) {
+            open_since = 0;
+            return;
+          }
+          if (!id(door_status).has_state()) return;
+          float pos = id(door_status).state;
+
+          if (pos > 1.0) {
+            // Door is open
+            if (open_since == 0) {
+              open_since = millis();
+            } else if (millis() - open_since > (uint32_t)minutes * 60000) {
+              ESP_LOGI("auto_close", "Auto-closing after %d min", minutes);
+              id(button_garage_close).press();
+              open_since = 0;  // reset to avoid repeated triggers
+            }
+          } else {
+            open_since = 0;  // door closed, reset timer
+          }
+
+# =====================================================================
+# SERVICES - exposed to Home Assistant
+# =====================================================================
+api:
+  encryption:
+    key: !secret secret_garage_door
+
+web_server:
+  port: 80

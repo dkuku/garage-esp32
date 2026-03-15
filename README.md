@@ -3,19 +3,25 @@ A standalone device used to control the garage motor unit from Forcedoor.
 It replaces their WiFi dongle, which is controlled via their F-LinX app.
 
 ## Features
-It's not fully featured 1:1 to their app, as I don't need all the functionality, but the basics work:
-- Send commands to Open / Stop / Close / Partial Open / LED ON / LED OFF
-- Receive status - Door opened 0-100%, LED status
+Full feature parity with the original F-LinX / Noru app:
+- Send commands: Open / Stop / Close / Partial Open (ventilation) / LED ON / LED OFF
+- Receive full status: door position 0-100%, direction, LED state, motor load, cycle counter
+- Cover entity with position control (open to X%)
+- Auto-close timer (configurable 0-60 min)
+- Motor load monitoring (useful for obstacle detection diagnostics)
 - Native integration into Home Assistant
 
 How the controls **can** look like in your Home Assistant
 ![image](./imgs/hass.jpg)
 
 Entities exposed:
+- Cover - Garage (open/close/stop + position slider)
 - Buttons - Open, Stop, Close, Partial Open
 - Light - LED
-- Sensor - door open %
-- Text sensor - Current operation - Opening, Closing, Stopped
+- Sensors - door position %, motor load, motor cycle counter
+- Binary sensor - door moving
+- Text sensor - current operation (Opening, Closing, Stopped)
+- Number - auto-close timer (minutes)
 
 How the finished system looks like - third part is a mounting bracket.
 Just connect the motor unit with a USB extension.
@@ -70,6 +76,8 @@ Connect your TTL-USB's ground with the USB's ground, Tx goes to D+, and you shou
 
 I have not tested this on another unit, but I would bet the protocol is the same, since their WiFi dongle is probably universal.
 
+The original dongle is manufactured by **Noru** and runs an ESP32-C3 with custom firmware (not standard Tuya). The UART protocol ("protov1") is fully reverse-engineered - see [PROTOCOL.md](./PROTOCOL.md) for complete details.
+
 ## Build
 
 A detailed look at the main box:
@@ -111,7 +119,7 @@ To send commands via serial:
 ```bash
 echo "23074100006b0d" | xxd -r -p | tio --baudrate 115200 /dev/ttyUSB0
 ```
-This is the command for Open. See the [`garage.yaml`](./imgs/garage.yaml) for all commands.
+This is the command for Open. See the [`garage.yaml`](./config/garage.yaml) for all commands.
 
 To receive status messages via serial
 ```bash
@@ -232,16 +240,52 @@ dongle -->> cloud: Update status
 ### Protocol over UART
 
 Each message follows this format:
-- 1 byte header
-- 1 byte length
-- payload of size (length - 4) (length minus header, length, CRC, footer)
-- 1 byte CRC = calculated
-- 1 byte footer = always `0x0D`
+```
+[HEADER] [LENGTH] [MSG_TYPE] [PAYLOAD...] [CRC] [0x0D]
+```
 
-The header is either:
-- `0x23` for commands (Dongle->Motor)
-- `0x40` for status/echo (Motor->Dongler)
+| Field | Size | Description |
+|-------|------|-------------|
+| HEADER | 1 byte | `0x23` for TX (ESP->Motor), `0x40` for RX (Motor->ESP) |
+| LENGTH | 1 byte | Total frame length (including header, length, CRC, footer) |
+| MSG_TYPE | 1 byte | `0x41` for commands, `0x49` for status, etc. |
+| PAYLOAD | variable | `LENGTH - 4` bytes |
+| CRC | 1 byte | Sum of all preceding bytes & 0xFF |
+| FOOTER | 1 byte | Always `0x0D` |
 
-The length byte equals to the whole message length (including header, length byte, footer).
-See the yaml how CRC is calculated.
+#### TX Commands (ESP -> Motor)
+
+Standard 7-byte frame: `[0x23] [0x07] [0x41] [CMD] [0x00] [CRC] [0x0D]`
+
+| CMD | Action |
+|-----|--------|
+| `0x00` | Open |
+| `0x01` | Stop |
+| `0x02` | Close |
+| `0x03` | Partial open (ventilation) |
+| `0xF0` | LED on |
+| `0xF1` | LED off |
+
+#### RX Status (Motor -> ESP)
+
+17-byte frame: `[0x40] [0x11] [0x49] [14 bytes] [0x0D]`
+
+After header, the 14-byte payload:
+
+| Offset | Name | Description |
+|--------|------|-------------|
+| 0 | MSG_TYPE | `0x49` |
+| 1 | DIRECTION | `0x00`=Opening, `0x01`=Stopped, `0x02`=Closing |
+| 2 | LED_STATE | `0xF0`=ON, `0xF1`=OFF |
+| 3-4 | CYCLE_COUNT_1 | Motor cycle counter (uint16 big-endian) |
+| 5-6 | CYCLE_COUNT_2 | Motor cycle counter #2 (always CC1+1) |
+| 7 | CONTROLLER_ID | Hardware ID, constant `0x74` |
+| 8 | ENCODER_POS | Raw encoder position (uint8, wraps around) |
+| 9 | RESERVED | Always `0x00` |
+| 10 | MOTOR_LOAD | Current/torque indicator. Higher when opening (~45), lower when closing (~19) |
+| 11 | POSITION | Door position 0-100% |
+| 12 | MOVE_FLAG | `0x00`=moving, `0x02`=stopped |
+| 13 | CRC | Checksum |
+
+For the full protocol documentation including all RX message types (command ack, config, pairing, temperature, etc.), see [PROTOCOL.md](./PROTOCOL.md).
 
